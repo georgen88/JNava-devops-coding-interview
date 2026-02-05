@@ -1,19 +1,19 @@
 ###############################################################################
-# main.tf — Complete AWS Infrastructure (single-file)
+# main.tf — Complete AWS Infrastructure (single file)
 #
 # Resources:
-#   - VPC with 3 public + 3 private subnets across AZs
+#   - VPC: 3 public + 3 private subnets across AZs
 #   - Internet Gateway, NAT Gateway, route tables
-#   - Application Load Balancer (public subnets)
-#   - ECS Fargate cluster + service (private subnets)
-#   - Aurora RDS PostgreSQL Multi-AZ (private subnets)
-#   - DocumentDB / MongoDB-compatible cluster (private subnets)
-#   - ECR repository
-#   - CloudFront + WAF (bonus security)
-#   - All security groups with least-privilege rules
+#   - Application Load Balancer (public subnets) → ECS (private subnets)
+#   - ECS Fargate: Python FastAPI app container
+#   - DocumentDB (MongoDB-compatible) Multi-AZ — app connects via MONGO_URI
+#   - Aurora RDS PostgreSQL Multi-AZ — provisioned per requirements
+#   - ECR repository for Docker images
+#   - CloudFront + WAF: rate limiting, AWS managed rule sets
+#   - Security groups: least-privilege (ALB→ECS→DBs only)
 #
-# Idempotency: all resources are declarative; re-running `terraform apply`
-# with the same inputs produces no changes.
+# The app uses two env vars: MONGO_URI and MONGO_DB_NAME
+# DocumentDB endpoint is injected into the ECS task definition automatically.
 ###############################################################################
 
 # ─── Providers & Backend ─────────────────────────────────────────────────────
@@ -28,8 +28,7 @@ terraform {
     }
   }
 
-  # Remote state — bucket/table passed via -backend-config in CI
-#  backend "s3" {}
+  #backend "s3" {}
 }
 
 provider "aws" {
@@ -47,15 +46,15 @@ provider "aws" {
 # ─── Variables ───────────────────────────────────────────────────────────────
 
 variable "aws_region" {
-  description = "AWS region for all resources"
+  description = "AWS region"
   type        = string
   default     = "us-east-1"
 }
 
 variable "app_name" {
-  description = "Application name used as prefix for all resources"
+  description = "Application name prefix"
   type        = string
-  default     = "myapp"
+  default     = "flights-api"
 }
 
 variable "environment" {
@@ -65,19 +64,19 @@ variable "environment" {
 }
 
 variable "vpc_cidr" {
-  description = "CIDR block for the VPC"
+  description = "VPC CIDR block"
   type        = string
   default     = "10.0.0.0/16"
 }
 
 variable "app_port" {
-  description = "Port the containerized application listens on"
+  description = "Port the FastAPI app listens on"
   type        = number
-  default     = 3000
+  default     = 8000
 }
 
 variable "app_image" {
-  description = "Full ECR image URI including tag (set by CI pipeline)"
+  description = "Full ECR image URI:tag — set by CI pipeline"
   type        = string
   default     = ""
 }
@@ -89,13 +88,13 @@ variable "ecs_cpu" {
 }
 
 variable "ecs_memory" {
-  description = "Fargate task memory in MiB"
+  description = "Fargate task memory (MiB)"
   type        = number
   default     = 512
 }
 
 variable "desired_count" {
-  description = "Number of ECS tasks to run"
+  description = "ECS desired task count"
   type        = number
   default     = 2
 }
@@ -104,39 +103,50 @@ variable "db_username" {
   description = "Aurora RDS master username"
   type        = string
   sensitive   = true
+  default     = "flights"
+
 }
 
 variable "db_password" {
-  description = "Aurora RDS master password"
+  description = "Aurora RDS master password (min 8 chars)"
   type        = string
   sensitive   = true
+  default     = "flights"
 }
 
 variable "docdb_username" {
-  description = "DocumentDB (MongoDB) master username"
+  description = "DocumentDB master username"
   type        = string
   sensitive   = true
+  default     = "flights"
 }
 
 variable "docdb_password" {
-  description = "DocumentDB (MongoDB) master password"
+  description = "DocumentDB master password (min 8 chars)"
   type        = string
   sensitive   = true
+  default     = "flights"
+}
+
+variable "mongo_db_name" {
+  description = "MongoDB database name used by the app"
+  type        = string
+  default     = "flights"
 }
 
 variable "aurora_instance_class" {
-  description = "Instance class for Aurora RDS"
+  description = "Aurora RDS instance class"
   type        = string
   default     = "db.r6g.large"
 }
 
 variable "docdb_instance_class" {
-  description = "Instance class for DocumentDB"
+  description = "DocumentDB instance class"
   type        = string
   default     = "db.r6g.large"
 }
 
-# ─── Data Sources ────────────────────────────────────────────────────────────
+# ─── Data Sources & Locals ───────────────────────────────────────────────────
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -145,54 +155,49 @@ data "aws_availability_zones" "available" {
 data "aws_caller_identity" "current" {}
 
 locals {
-  name_prefix = "${var.app_name}-${var.environment}"
-  azs         = slice(data.aws_availability_zones.available.names, 0, 3)
+  prefix = "${var.app_name}-${var.environment}"
+  azs    = slice(data.aws_availability_zones.available.names, 0, 3)
 
-  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  private_subnets = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
+  public_cidrs  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  private_cidrs = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
 
-  # CloudFront custom header to restrict ALB access
-  cf_custom_header_name  = "X-CF-Secret"
-  cf_custom_header_value = "cf-${var.app_name}-${var.environment}-auth-token"
+  cf_header_name  = "X-CF-Secret"
+  cf_header_value = "cf-${var.app_name}-${var.environment}-secret"
 }
 
 ###############################################################################
-# VPC
+# VPC + NETWORKING
 ###############################################################################
 
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
-
-  tags = { Name = "${local.name_prefix}-vpc" }
+  tags                 = { Name = "${local.prefix}-vpc" }
 }
-
-# ─── Internet Gateway ────────────────────────────────────────────────────────
 
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
-  tags   = { Name = "${local.name_prefix}-igw" }
+  tags   = { Name = "${local.prefix}-igw" }
 }
 
-# ─── Public Subnets ──────────────────────────────────────────────────────────
+# ── Public subnets ───────────────────────────────────────────────────────────
 
 resource "aws_subnet" "public" {
   count                   = 3
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = local.public_subnets[count.index]
+  cidr_block              = local.public_cidrs[count.index]
   availability_zone       = local.azs[count.index]
   map_public_ip_on_launch = true
-
-  tags = { Name = "${local.name_prefix}-public-${local.azs[count.index]}" }
+  tags                    = { Name = "${local.prefix}-public-${local.azs[count.index]}" }
 }
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
-  tags   = { Name = "${local.name_prefix}-public-rt" }
+  tags   = { Name = "${local.prefix}-public-rt" }
 }
 
-resource "aws_route" "public_internet" {
+resource "aws_route" "public_igw" {
   route_table_id         = aws_route_table.public.id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.main.id
@@ -204,36 +209,33 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# ─── NAT Gateway (single — use one per AZ for prod HA) ──────────────────────
+# ── NAT Gateway ──────────────────────────────────────────────────────────────
 
 resource "aws_eip" "nat" {
   domain = "vpc"
-  tags   = { Name = "${local.name_prefix}-nat-eip" }
+  tags   = { Name = "${local.prefix}-nat-eip" }
 }
 
 resource "aws_nat_gateway" "main" {
   allocation_id = aws_eip.nat.id
   subnet_id     = aws_subnet.public[0].id
-
-  tags = { Name = "${local.name_prefix}-nat" }
-
-  depends_on = [aws_internet_gateway.main]
+  tags          = { Name = "${local.prefix}-nat" }
+  depends_on    = [aws_internet_gateway.main]
 }
 
-# ─── Private Subnets ─────────────────────────────────────────────────────────
+# ── Private subnets ──────────────────────────────────────────────────────────
 
 resource "aws_subnet" "private" {
   count             = 3
   vpc_id            = aws_vpc.main.id
-  cidr_block        = local.private_subnets[count.index]
+  cidr_block        = local.private_cidrs[count.index]
   availability_zone = local.azs[count.index]
-
-  tags = { Name = "${local.name_prefix}-private-${local.azs[count.index]}" }
+  tags              = { Name = "${local.prefix}-private-${local.azs[count.index]}" }
 }
 
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
-  tags   = { Name = "${local.name_prefix}-private-rt" }
+  tags   = { Name = "${local.prefix}-private-rt" }
 }
 
 resource "aws_route" "private_nat" {
@@ -252,11 +254,10 @@ resource "aws_route_table_association" "private" {
 # SECURITY GROUPS
 ###############################################################################
 
-# ALB — accepts 80/443 from anywhere (restricted by WAF + CloudFront header)
 resource "aws_security_group" "alb" {
-  name_prefix = "${local.name_prefix}-alb-"
+  name_prefix = "${local.prefix}-alb-"
   vpc_id      = aws_vpc.main.id
-  description = "ALB security group"
+  description = "ALB - HTTP/HTTPS inbound"
 
   ingress {
     description = "HTTP"
@@ -282,18 +283,16 @@ resource "aws_security_group" "alb" {
   }
 
   lifecycle { create_before_destroy = true }
-
-  tags = { Name = "${local.name_prefix}-alb-sg" }
+  tags = { Name = "${local.prefix}-alb-sg" }
 }
 
-# ECS Tasks — only from ALB
 resource "aws_security_group" "ecs" {
-  name_prefix = "${local.name_prefix}-ecs-"
+  name_prefix = "${local.prefix}-ecs-"
   vpc_id      = aws_vpc.main.id
-  description = "ECS tasks security group"
+  description = "ECS tasks - inbound from ALB only"
 
   ingress {
-    description     = "From ALB"
+    description     = "App port from ALB"
     from_port       = var.app_port
     to_port         = var.app_port
     protocol        = "tcp"
@@ -308,41 +307,13 @@ resource "aws_security_group" "ecs" {
   }
 
   lifecycle { create_before_destroy = true }
-
-  tags = { Name = "${local.name_prefix}-ecs-sg" }
+  tags = { Name = "${local.prefix}-ecs-sg" }
 }
 
-# Aurora RDS — only from ECS tasks
-resource "aws_security_group" "aurora" {
-  name_prefix = "${local.name_prefix}-aurora-"
-  vpc_id      = aws_vpc.main.id
-  description = "Aurora RDS security group"
-
-  ingress {
-    description     = "PostgreSQL from ECS"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.ecs.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  lifecycle { create_before_destroy = true }
-
-  tags = { Name = "${local.name_prefix}-aurora-sg" }
-}
-
-# DocumentDB (Mongo) — only from ECS tasks
 resource "aws_security_group" "docdb" {
-  name_prefix = "${local.name_prefix}-docdb-"
+  name_prefix = "${local.prefix}-docdb-"
   vpc_id      = aws_vpc.main.id
-  description = "DocumentDB security group"
+  description = "DocumentDB - inbound from ECS only"
 
   ingress {
     description     = "MongoDB from ECS"
@@ -360,12 +331,35 @@ resource "aws_security_group" "docdb" {
   }
 
   lifecycle { create_before_destroy = true }
+  tags = { Name = "${local.prefix}-docdb-sg" }
+}
 
-  tags = { Name = "${local.name_prefix}-docdb-sg" }
+resource "aws_security_group" "aurora" {
+  name_prefix = "${local.prefix}-aurora-"
+  vpc_id      = aws_vpc.main.id
+  description = "Aurora RDS - inbound from ECS only"
+
+  ingress {
+    description     = "PostgreSQL from ECS"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle { create_before_destroy = true }
+  tags = { Name = "${local.prefix}-aurora-sg" }
 }
 
 ###############################################################################
-# ECR REPOSITORY
+# ECR
 ###############################################################################
 
 resource "aws_ecr_repository" "app" {
@@ -376,13 +370,11 @@ resource "aws_ecr_repository" "app" {
   image_scanning_configuration {
     scan_on_push = true
   }
-
-  tags = { Name = "${local.name_prefix}-ecr" }
+  tags = { Name = "${local.prefix}-ecr" }
 }
 
 resource "aws_ecr_lifecycle_policy" "app" {
   repository = aws_ecr_repository.app.name
-
   policy = jsonencode({
     rules = [{
       rulePriority = 1
@@ -402,38 +394,36 @@ resource "aws_ecr_lifecycle_policy" "app" {
 ###############################################################################
 
 resource "aws_lb" "main" {
-  name               = "${local.name_prefix}-alb"
+  name               = "${local.prefix}-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = aws_subnet.public[*].id
-
-  tags = { Name = "${local.name_prefix}-alb" }
+  tags               = { Name = "${local.prefix}-alb" }
 }
 
 resource "aws_lb_target_group" "app" {
-  name        = "${local.name_prefix}-tg"
+  name        = "${local.prefix}-tg"
   port        = var.app_port
   protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id
   target_type = "ip"
 
   health_check {
-    path                = "/health"
+    path                = "/"
     protocol            = "HTTP"
+    matcher             = "204"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     timeout             = 5
     interval            = 30
-    matcher             = "200"
   }
 
   lifecycle { create_before_destroy = true }
-
-  tags = { Name = "${local.name_prefix}-tg" }
+  tags = { Name = "${local.prefix}-tg" }
 }
 
-# Default listener returns 403 unless CloudFront custom header is present
+# Default: 403 unless CloudFront header present
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80
@@ -449,15 +439,14 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# Rule that forwards traffic only when the CloudFront secret header matches
 resource "aws_lb_listener_rule" "cf_forward" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 1
 
   condition {
     http_header {
-      http_header_name = local.cf_custom_header_name
-      values           = [local.cf_custom_header_value]
+      http_header_name = local.cf_header_name
+      values           = [local.cf_header_value]
     }
   }
 
@@ -468,18 +457,49 @@ resource "aws_lb_listener_rule" "cf_forward" {
 }
 
 ###############################################################################
-# AURORA RDS — PostgreSQL Multi-AZ
+# DOCUMENTDB (MongoDB-compatible) — private subnets, Multi-AZ
+###############################################################################
+
+resource "aws_docdb_subnet_group" "main" {
+  name       = "${local.prefix}-docdb-subnets"
+  subnet_ids = aws_subnet.private[*].id
+  tags       = { Name = "${local.prefix}-docdb-subnets" }
+}
+
+resource "aws_docdb_cluster" "main" {
+  cluster_identifier     = "${local.prefix}-docdb"
+  engine                 = "docdb"
+  master_username        = var.docdb_username
+  master_password        = var.docdb_password
+  db_subnet_group_name   = aws_docdb_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.docdb.id]
+  storage_encrypted      = true
+  deletion_protection    = false
+  skip_final_snapshot    = true
+  tags                   = { Name = "${local.prefix}-docdb" }
+}
+
+# 2 instances across AZs for Multi-AZ
+resource "aws_docdb_cluster_instance" "main" {
+  count              = 2
+  identifier         = "${local.prefix}-docdb-${count.index}"
+  cluster_identifier = aws_docdb_cluster.main.id
+  instance_class     = var.docdb_instance_class
+  tags               = { Name = "${local.prefix}-docdb-${count.index}" }
+}
+
+###############################################################################
+# AURORA RDS PostgreSQL — Multi-AZ (per requirements)
 ###############################################################################
 
 resource "aws_db_subnet_group" "aurora" {
-  name       = "${local.name_prefix}-aurora-subnet-group"
+  name       = "${local.prefix}-aurora-subnets"
   subnet_ids = aws_subnet.private[*].id
-
-  tags = { Name = "${local.name_prefix}-aurora-subnet-group" }
+  tags       = { Name = "${local.prefix}-aurora-subnets" }
 }
 
 resource "aws_rds_cluster" "aurora" {
-  cluster_identifier     = "${local.name_prefix}-aurora"
+  cluster_identifier     = "${local.prefix}-aurora"
   engine                 = "aurora-postgresql"
   engine_version         = "15.4"
   database_name          = replace(var.app_name, "-", "_")
@@ -487,87 +507,44 @@ resource "aws_rds_cluster" "aurora" {
   master_password        = var.db_password
   db_subnet_group_name   = aws_db_subnet_group.aurora.name
   vpc_security_group_ids = [aws_security_group.aurora.id]
-
-  storage_encrypted   = true
-  deletion_protection = false # set true for real prod
-  skip_final_snapshot = true  # set false for real prod
-
-  tags = { Name = "${local.name_prefix}-aurora-cluster" }
+  storage_encrypted      = true
+  deletion_protection    = false
+  skip_final_snapshot    = true
+  tags                   = { Name = "${local.prefix}-aurora" }
 }
 
-# Multi-AZ: two instances across different AZs
 resource "aws_rds_cluster_instance" "aurora" {
   count              = 2
-  identifier         = "${local.name_prefix}-aurora-${count.index}"
+  identifier         = "${local.prefix}-aurora-${count.index}"
   cluster_identifier = aws_rds_cluster.aurora.id
   instance_class     = var.aurora_instance_class
   engine             = aws_rds_cluster.aurora.engine
   engine_version     = aws_rds_cluster.aurora.engine_version
-
-  tags = { Name = "${local.name_prefix}-aurora-instance-${count.index}" }
+  tags               = { Name = "${local.prefix}-aurora-${count.index}" }
 }
 
 ###############################################################################
-# DOCUMENTDB (MongoDB-compatible) — Private Subnets
-###############################################################################
-
-resource "aws_docdb_subnet_group" "main" {
-  name       = "${local.name_prefix}-docdb-subnet-group"
-  subnet_ids = aws_subnet.private[*].id
-
-  tags = { Name = "${local.name_prefix}-docdb-subnet-group" }
-}
-
-resource "aws_docdb_cluster" "main" {
-  cluster_identifier     = "${local.name_prefix}-docdb"
-  engine                 = "docdb"
-  master_username        = var.docdb_username
-  master_password        = var.docdb_password
-  db_subnet_group_name   = aws_docdb_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.docdb.id]
-
-  storage_encrypted   = true
-  deletion_protection = false
-  skip_final_snapshot = true
-
-  tags = { Name = "${local.name_prefix}-docdb-cluster" }
-}
-
-resource "aws_docdb_cluster_instance" "main" {
-  count              = 2
-  identifier         = "${local.name_prefix}-docdb-${count.index}"
-  cluster_identifier = aws_docdb_cluster.main.id
-  instance_class     = var.docdb_instance_class
-
-  tags = { Name = "${local.name_prefix}-docdb-instance-${count.index}" }
-}
-
-###############################################################################
-# ECS FARGATE — App Deployment (Private Subnets)
+# ECS FARGATE — FastAPI app on private subnets
 ###############################################################################
 
 resource "aws_ecs_cluster" "main" {
-  name = "${local.name_prefix}-cluster"
-
+  name = "${local.prefix}-cluster"
   setting {
     name  = "containerInsights"
     value = "enabled"
   }
-
-  tags = { Name = "${local.name_prefix}-cluster" }
+  tags = { Name = "${local.prefix}-cluster" }
 }
 
 resource "aws_cloudwatch_log_group" "ecs" {
-  name              = "/ecs/${local.name_prefix}"
+  name              = "/ecs/${local.prefix}"
   retention_in_days = 30
-
-  tags = { Name = "${local.name_prefix}-logs" }
+  tags              = { Name = "${local.prefix}-logs" }
 }
 
-# IAM — Task Execution Role (ECR pull + CloudWatch logs)
+# IAM — execution role (ECR pull + CloudWatch)
 resource "aws_iam_role" "ecs_execution" {
-  name = "${local.name_prefix}-ecs-execution-role"
-
+  name = "${local.prefix}-ecs-exec-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -576,8 +553,7 @@ resource "aws_iam_role" "ecs_execution" {
       Action    = "sts:AssumeRole"
     }]
   })
-
-  tags = { Name = "${local.name_prefix}-ecs-execution-role" }
+  tags = { Name = "${local.prefix}-ecs-exec-role" }
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_execution" {
@@ -585,10 +561,9 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# IAM — Task Role (app-level permissions if needed)
+# IAM — task role (app-level perms)
 resource "aws_iam_role" "ecs_task" {
-  name = "${local.name_prefix}-ecs-task-role"
-
+  name = "${local.prefix}-ecs-task-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -597,13 +572,12 @@ resource "aws_iam_role" "ecs_task" {
       Action    = "sts:AssumeRole"
     }]
   })
-
-  tags = { Name = "${local.name_prefix}-ecs-task-role" }
+  tags = { Name = "${local.prefix}-ecs-task-role" }
 }
 
-# Task Definition
+# Task definition — injects DocumentDB endpoint as MONGO_URI
 resource "aws_ecs_task_definition" "app" {
-  family                   = "${local.name_prefix}-task"
+  family                   = "${local.prefix}-task"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = var.ecs_cpu
@@ -622,12 +596,19 @@ resource "aws_ecs_task_definition" "app" {
     }]
 
     environment = [
-      { name = "PORT", value = tostring(var.app_port) },
-      { name = "NODE_ENV", value = var.environment },
-      # Aurora RDS endpoint — replaces local DB in docker-compose
-      { name = "DATABASE_URL", value = "postgresql://${var.db_username}:${var.db_password}@${aws_rds_cluster.aurora.endpoint}:5432/${replace(var.app_name, "-", "_")}" },
-      # DocumentDB (MongoDB) endpoint
-      { name = "MONGO_URI", value = "mongodb://${var.docdb_username}:${var.docdb_password}@${aws_docdb_cluster.main.endpoint}:27017/?tls=true&tlsCAFile=/tmp/rds-combined-ca-bundle.pem&retryWrites=false" },
+      {
+        name  = "MONGO_URI"
+        value = "mongodb://${var.docdb_username}:${var.docdb_password}@${aws_docdb_cluster.main.endpoint}:27017/?tls=true&tlsCAFile=/tmp/rds-combined-ca-bundle.pem&retryWrites=false&directConnection=true"
+      },
+      {
+        name  = "MONGO_DB_NAME"
+        value = var.mongo_db_name
+      },
+      # Aurora RDS endpoint available if app needs a relational DB later
+      {
+        name  = "DATABASE_URL"
+        value = "postgresql://${var.db_username}:${var.db_password}@${aws_rds_cluster.aurora.endpoint}:5432/${replace(var.app_name, "-", "_")}"
+      },
     ]
 
     logConfiguration = {
@@ -640,12 +621,11 @@ resource "aws_ecs_task_definition" "app" {
     }
   }])
 
-  tags = { Name = "${local.name_prefix}-task-def" }
+  tags = { Name = "${local.prefix}-task-def" }
 }
 
-# ECS Service
 resource "aws_ecs_service" "app" {
-  name            = "${local.name_prefix}-service"
+  name            = "${local.prefix}-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
   desired_count   = var.desired_count
@@ -663,33 +643,27 @@ resource "aws_ecs_service" "app" {
     container_port   = var.app_port
   }
 
-  # Allow CI to force new deployments without drift
   lifecycle {
     ignore_changes = [desired_count, task_definition]
   }
 
   depends_on = [aws_lb_listener.http]
-
-  tags = { Name = "${local.name_prefix}-ecs-service" }
+  tags       = { Name = "${local.prefix}-service" }
 }
 
 ###############################################################################
-# CLOUDFRONT + WAF (Bonus Security)
+# CLOUDFRONT + WAF (Bonus)
 ###############################################################################
 
-# WAF WebACL — rate limiting + AWS managed rules
 resource "aws_wafv2_web_acl" "main" {
-  name  = "${local.name_prefix}-waf"
+  name  = "${local.prefix}-waf"
   scope = "CLOUDFRONT"
-
-  # Must be us-east-1 for CloudFront WAF — handled by provider alias if needed
-  # For simplicity, we assume var.aws_region = us-east-1 or use a provider alias
 
   default_action {
     allow {}
   }
 
-  # Rate limit: 2000 requests per 5 minutes per IP
+  # Rate limit: 2000 req / 5 min per IP
   rule {
     name     = "rate-limit"
     priority = 1
@@ -705,11 +679,11 @@ resource "aws_wafv2_web_acl" "main" {
     visibility_config {
       sampled_requests_enabled   = true
       cloudwatch_metrics_enabled = true
-      metric_name                = "${local.name_prefix}-rate-limit"
+      metric_name                = "${local.prefix}-rate-limit"
     }
   }
 
-  # AWS Managed — Common Rule Set
+  # AWS managed common rule set
   rule {
     name     = "aws-common-rules"
     priority = 2
@@ -725,11 +699,11 @@ resource "aws_wafv2_web_acl" "main" {
     visibility_config {
       sampled_requests_enabled   = true
       cloudwatch_metrics_enabled = true
-      metric_name                = "${local.name_prefix}-common-rules"
+      metric_name                = "${local.prefix}-common-rules"
     }
   }
 
-  # AWS Managed — Known Bad Inputs
+  # AWS managed known bad inputs
   rule {
     name     = "aws-bad-inputs"
     priority = 3
@@ -745,24 +719,23 @@ resource "aws_wafv2_web_acl" "main" {
     visibility_config {
       sampled_requests_enabled   = true
       cloudwatch_metrics_enabled = true
-      metric_name                = "${local.name_prefix}-bad-inputs"
+      metric_name                = "${local.prefix}-bad-inputs"
     }
   }
 
   visibility_config {
     sampled_requests_enabled   = true
     cloudwatch_metrics_enabled = true
-    metric_name                = "${local.name_prefix}-waf"
+    metric_name                = "${local.prefix}-waf"
   }
 
-  tags = { Name = "${local.name_prefix}-waf" }
+  tags = { Name = "${local.prefix}-waf" }
 }
 
-# CloudFront Distribution — fronts the ALB
 resource "aws_cloudfront_distribution" "main" {
   enabled         = true
   is_ipv6_enabled = true
-  comment         = "${local.name_prefix} API distribution"
+  comment         = "${local.prefix} API"
   web_acl_id      = aws_wafv2_web_acl.main.arn
 
   origin {
@@ -776,10 +749,9 @@ resource "aws_cloudfront_distribution" "main" {
       origin_ssl_protocols   = ["TLSv1.2"]
     }
 
-    # Custom header so ALB only accepts traffic from CloudFront
     custom_header {
-      name  = local.cf_custom_header_name
-      value = local.cf_custom_header_value
+      name  = local.cf_header_name
+      value = local.cf_header_value
     }
   }
 
@@ -812,7 +784,7 @@ resource "aws_cloudfront_distribution" "main" {
     cloudfront_default_certificate = true
   }
 
-  tags = { Name = "${local.name_prefix}-cloudfront" }
+  tags = { Name = "${local.prefix}-cloudfront" }
 }
 
 ###############################################################################
@@ -820,28 +792,25 @@ resource "aws_cloudfront_distribution" "main" {
 ###############################################################################
 
 output "vpc_id" {
-  description = "VPC ID"
-  value       = aws_vpc.main.id
-}
-
-output "public_subnet_ids" {
-  description = "Public subnet IDs"
-  value       = aws_subnet.public[*].id
-}
-
-output "private_subnet_ids" {
-  description = "Private subnet IDs"
-  value       = aws_subnet.private[*].id
+  value = aws_vpc.main.id
 }
 
 output "alb_dns_name" {
-  description = "ALB DNS name"
-  value       = aws_lb.main.dns_name
+  value = aws_lb.main.dns_name
 }
 
 output "cloudfront_domain" {
-  description = "CloudFront distribution domain (use this as the app URL)"
+  description = "Public URL — use this to reach the API"
   value       = aws_cloudfront_distribution.main.domain_name
+}
+
+output "ecr_repository_url" {
+  value = aws_ecr_repository.app.repository_url
+}
+
+output "docdb_endpoint" {
+  description = "DocumentDB (MongoDB) endpoint for MONGO_URI"
+  value       = aws_docdb_cluster.main.endpoint
 }
 
 output "aurora_endpoint" {
@@ -850,26 +819,14 @@ output "aurora_endpoint" {
 }
 
 output "aurora_reader_endpoint" {
-  description = "Aurora RDS reader endpoint"
-  value       = aws_rds_cluster.aurora.reader_endpoint
-}
-
-output "docdb_endpoint" {
-  description = "DocumentDB (MongoDB) cluster endpoint"
-  value       = aws_docdb_cluster.main.endpoint
-}
-
-output "ecr_repository_url" {
-  description = "ECR repository URL"
-  value       = aws_ecr_repository.app.repository_url
+  value = aws_rds_cluster.aurora.reader_endpoint
 }
 
 output "ecs_cluster_name" {
-  description = "ECS cluster name"
-  value       = aws_ecs_cluster.main.name
+  value = aws_ecs_cluster.main.name
 }
 
 output "ecs_service_name" {
-  description = "ECS service name"
-  value       = aws_ecs_service.app.name
+  value = aws_ecs_service.app.name
 }
+

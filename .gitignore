@@ -7,5 +7,7 @@ tfplan
 plan_output.txt
 *.pem
 .env
-node_modules/
-dist/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

@@ -1,0 +1,73 @@
+###############################################################################
+# Rollback — Manual emergency trigger via GitHub Actions UI
+#
+# Primary rollback method: git revert on main (re-triggers CI/CD pipeline).
+# This workflow: deploy a specific previous image tag without touching IaC.
+###############################################################################
+
+name: "Rollback Deployment"
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag (git SHA) to roll back to"
+        required: true
+        type: string
+      confirm:
+        description: "Type ROLLBACK to confirm"
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  APP_NAME: flights-api
+  ENVIRONMENT: prod
+
+jobs:
+  rollback:
+    name: "Rollback ECS"
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'ROLLBACK'
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify image exists in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name ${{ env.APP_NAME }} \
+            --image-ids imageTag=${{ github.event.inputs.image_tag }}
+
+      - name: Register rollback task definition
+        run: |
+          ROLLBACK_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.APP_NAME }}:${{ github.event.inputs.image_tag }}"
+
+          CURRENT_TD=$(aws ecs describe-services \
+            --cluster ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}-cluster \
+            --services ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}-service \
+            --query 'services[0].taskDefinition' --output text)
+
+          aws ecs describe-task-definition --task-definition "$CURRENT_TD" \
+            --query 'taskDefinition' | \
+          jq --arg IMG "$ROLLBACK_IMAGE" \
+            'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy) |
+             .containerDefinitions[0].image = $IMG' > rollback-td.json
+
+          aws ecs register-task-definition --cli-input-json file://rollback-td.json
+
+      - name: Deploy rollback
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}-cluster \
+            --service ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}-service \
+            --force-new-deployment
+
+      - name: Wait for stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}-cluster \
+            --services ${{ env.APP_NAME }}-${{ env.ENVIRONMENT }}-service

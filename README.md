@@ -1,22 +1,21 @@
-# Infrastructure & CI/CD Pipeline
+# Flights API — Infrastructure & CI/CD
 
 ## What This Deploys
 
-All infrastructure lives in a **single `main.tf`** file. The CI/CD pipeline is defined in `.github/workflows/`.
+A **Python FastAPI** application (flights CRUD API) containerized with Docker and deployed to **AWS ECS Fargate** behind CloudFront + WAF.
 
-**AWS Resources created by Terraform:**
+**AWS resources** (all in `main.tf`):
 
-- VPC with 3 public subnets + 3 private subnets across AZs
+- VPC with 3 public + 3 private subnets across AZs
 - Internet Gateway, NAT Gateway, route tables
-- Application Load Balancer (public subnets)
-- ECS Fargate cluster + service (private subnets)
-- Aurora RDS PostgreSQL Multi-AZ cluster (private subnets)
-- DocumentDB / MongoDB-compatible cluster (private subnets)
+- Application Load Balancer (public) → ECS Fargate (private)
+- DocumentDB Multi-AZ (MongoDB-compatible) — the app connects via `MONGO_URI`
+- Aurora RDS PostgreSQL Multi-AZ — provisioned per requirements
 - ECR repository with lifecycle policy
-- CloudFront distribution + AWS WAF (rate limiting, managed rules)
-- Security groups with least-privilege access (ALB→ECS→DBs only)
+- CloudFront + AWS WAF (rate limiting, managed rule sets)
+- Security groups: ALB → ECS → DocumentDB/Aurora only
 
-**Traffic flow:** CloudFront (WAF) → ALB (custom header validation) → ECS Fargate (private) → Aurora RDS / DocumentDB (private)
+**Traffic flow:** `CloudFront (WAF) → ALB (custom header gate) → ECS Fargate (private) → DocumentDB (private)`
 
 ---
 
@@ -24,14 +23,27 @@ All infrastructure lives in a **single `main.tf`** file. The CI/CD pipeline is d
 
 ```
 .
-├── main.tf                          # All Terraform resources (single file)
+├── main.tf                          # All Terraform resources
 ├── terraform.tfvars.example         # Example variable values
 ├── .github/workflows/
 │   ├── ci-cd.yml                    # Main CI/CD pipeline
 │   └── rollback.yml                 # Manual emergency rollback
 ├── docker/
-│   ├── Dockerfile                   # Multi-stage app build
-│   └── docker-compose.yml           # Local dev compose
+│   ├── Dockerfile                   # Python 3.12 + uvicorn
+│   └── docker-compose.yml           # Local dev (app + local Mongo)
+├── api/                             # FastAPI application source
+│   ├── main.py                      # App entrypoint (health: GET /)
+│   ├── settings.py                  # MONGO_URI + MONGO_DB_NAME config
+│   ├── mongo.py                     # PyMongo client helpers
+│   ├── dependencies.py              # FastAPI DI wiring
+│   ├── flights/
+│   │   ├── router.py                # GET/POST /flights
+│   │   ├── service.py               # Business logic
+│   │   └── models.py                # Pydantic models
+│   └── tests/
+│       ├── test_flights.py          # Flight CRUD tests (mongomock)
+│       └── test_liveness.py         # Health check test
+├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
@@ -40,44 +52,55 @@ All infrastructure lives in a **single `main.tf`** file. The CI/CD pipeline is d
 
 ## GitHub Secrets (Required)
 
-Configure in **GitHub → Settings → Secrets and Variables → Actions**:
-
 | Secret | Description |
 |---|---|
-| `AWS_ACCESS_KEY_ID` | IAM access key with permissions for ECR, ECS, RDS, VPC, CloudFront, WAF |
-| `AWS_SECRET_ACCESS_KEY` | Corresponding IAM secret key |
-| `AWS_REGION` | AWS region (e.g. `us-east-1`) |
-| `AWS_ACCOUNT_ID` | 12-digit AWS account ID |
+| `AWS_ACCESS_KEY_ID` | IAM access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key |
+| `AWS_REGION` | e.g. `us-east-1` |
+| `AWS_ACCOUNT_ID` | 12-digit account ID |
 | `DB_USERNAME` | Aurora RDS master username |
-| `DB_PASSWORD` | Aurora RDS master password |
+| `DB_PASSWORD` | Aurora RDS master password (min 8 chars) |
 | `DOCDB_USERNAME` | DocumentDB master username |
-| `DOCDB_PASSWORD` | DocumentDB master password |
-| `TF_STATE_BUCKET` | S3 bucket name for Terraform remote state |
-| `TF_LOCK_TABLE` | DynamoDB table name for state locking |
+| `DOCDB_PASSWORD` | DocumentDB master password (min 8 chars) |
+| `TF_STATE_BUCKET` | S3 bucket for Terraform state |
+| `TF_LOCK_TABLE` | DynamoDB table for state locking |
 
 ---
 
-## CI/CD Pipeline Flow
+## Application Environment Variables
 
-### On Push to `main` (full deploy):
+The app (via `api/settings.py`) requires exactly two env vars:
+
+| Variable | Description | Set by |
+|---|---|---|
+| `MONGO_URI` | MongoDB connection string | Terraform → ECS task definition (points to DocumentDB) |
+| `MONGO_DB_NAME` | Database name (`flights`) | Terraform → ECS task definition |
+
+In the ECS task definition, Terraform injects the DocumentDB endpoint into `MONGO_URI` automatically. The Aurora RDS endpoint is also injected as `DATABASE_URL` for future use.
+
+---
+
+## CI/CD Pipeline
+
+### Push to `main` (full deploy):
 
 ```
-terraform validate → terraform plan → docker build+push to ECR → terraform apply → ECS force deploy
+pytest → terraform validate → terraform plan → docker build → terraform apply → ECS deploy
 ```
 
-### On PR to `main` (validation only):
+### PR to `main` (validation only):
 
 ```
-terraform validate → terraform plan → plan posted as PR comment
+pytest → terraform validate → terraform plan → plan posted as PR comment
 ```
 
-Each job depends on the previous one succeeding. If `terraform validate` or `terraform plan` fails, the pipeline stops — no build, no deploy.
+If **pytest** or **terraform validate/plan** fails, the pipeline stops immediately — no build, no deploy.
 
 ### Rollback
 
-**Primary method (branch-based):** `git revert HEAD && git push origin main`. The pipeline re-runs and deploys the previous known-good state.
+**Primary (branch-based):** `git revert HEAD && git push origin main` — pipeline redeploys the previous state.
 
-**Emergency method:** Go to Actions → "Rollback Deployment" → Run workflow → provide the image tag (git SHA) to roll back to and type `ROLLBACK` to confirm.
+**Emergency:** Actions → Rollback Deployment → Run workflow → enter the image tag (git SHA) + type `ROLLBACK`.
 
 ---
 
@@ -85,15 +108,12 @@ Each job depends on the previous one succeeding. If `terraform validate` or `ter
 
 ### Prerequisites
 
-- Terraform >= 1.6
-- AWS CLI >= 2.x
-- Docker >= 24.x
+- Terraform >= 1.6, AWS CLI >= 2.x, Docker >= 24.x, Python 3.12
 
-### 1. Create the Terraform Backend
+### 1. Bootstrap Terraform Backend
 
 ```bash
 aws s3 mb s3://my-tf-state-bucket --region us-east-1
-
 aws dynamodb create-table \
   --table-name terraform-lock \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
@@ -101,56 +121,52 @@ aws dynamodb create-table \
   --billing-mode PAY_PER_REQUEST
 ```
 
-### 2. Deploy Locally (optional)
+### 2. Local Development
+
+```bash
+cd docker
+docker-compose up --build
+# API: http://localhost:8000
+# Health: GET /         → 204
+# Flights: GET/POST /flights
+```
+
+### 3. Deploy Manually (optional)
 
 ```bash
 terraform init \
   -backend-config="bucket=my-tf-state-bucket" \
-  -backend-config="key=myapp/prod/terraform.tfstate" \
+  -backend-config="key=flights-api/prod/terraform.tfstate" \
   -backend-config="region=us-east-1" \
   -backend-config="dynamodb_table=terraform-lock" \
   -backend-config="encrypt=true"
 
 terraform validate
-terraform plan -var="db_username=admin" -var="db_password=CHANGE_ME" \
-               -var="docdb_username=mongoadmin" -var="docdb_password=CHANGE_ME"
+terraform plan \
+  -var="db_username=admin" -var="db_password=CHANGE_ME" \
+  -var="docdb_username=mongoadmin" -var="docdb_password=CHANGE_ME"
 terraform apply
 ```
 
-### 3. Local Docker Development
+### 4. Automated (GitHub Actions)
 
-```bash
-cd docker
-docker-compose up --build
-# App at http://localhost:3000, local Mongo at localhost:27017
-```
-
-In production the app connects to Aurora RDS and DocumentDB endpoints instead of local containers. The `DATABASE_URL` and `MONGO_URI` env vars in the ECS task definition point to the Terraform-provisioned cluster endpoints.
-
-### 4. Automated via GitHub Actions
-
-Push to `main` or open a PR. The pipeline handles validate → plan → build → apply → deploy automatically.
+Push to `main` or open a PR. The pipeline runs tests, validates infra, and deploys automatically.
 
 ---
 
-## Security Configuration (Bonus)
+## Security (Bonus)
 
-**CloudFront + WAF:**
-- All traffic enters through CloudFront, which attaches an AWS WAF WebACL
-- WAF rules: rate limiting (2000 req/5min per IP), AWS Common Rule Set, Known Bad Inputs
-- ALB rejects any request missing the CloudFront custom header (`X-CF-Secret`) — returns 403
-
-**Network isolation:**
-- ECS tasks and databases run in private subnets only (no public IPs)
-- NAT Gateway provides outbound-only internet for private subnets
-- Security groups: ALB → ECS (app port only) → Aurora (5432) / DocumentDB (27017)
-- All database storage encrypted at rest, TLS enforced in transit
+- **CloudFront + WAF:** rate limit 2000 req/5min/IP, AWS Common Rules, Known Bad Inputs
+- **ALB gating:** returns 403 unless CloudFront custom header (`X-CF-Secret`) is present — blocks direct ALB access
+- **Network isolation:** ECS + databases in private subnets only, NAT for outbound
+- **SG least-privilege:** ALB→ECS (port 8000), ECS→DocDB (27017), ECS→Aurora (5432)
+- **Encryption:** storage at rest for Aurora + DocumentDB, TLS in transit
 
 ---
 
 ## Idempotency
 
-All resources are fully declarative Terraform. Running `terraform apply` multiple times with the same inputs produces zero changes. The ECS service uses `lifecycle { ignore_changes = [desired_count, task_definition] }` so that CI-driven deployments don't cause Terraform drift.
+All resources are declarative Terraform. Running `terraform apply` with the same inputs produces zero changes. The ECS service uses `ignore_changes = [desired_count, task_definition]` so CI-driven deploys don't cause drift.
 
 ---
 
@@ -158,7 +174,10 @@ All resources are fully declarative Terraform. Running `terraform apply` multipl
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| hashicorp/aws provider | ~> 5.0 | AWS resource management |
+| hashicorp/aws | ~> 5.0 | AWS provider |
 | Terraform | >= 1.6 | IaC engine |
-| Docker | >= 24.0 | Container builds |
-| GitHub Actions | v4 | CI/CD runner |
+| Python | 3.12 | App runtime |
+| FastAPI | 0.112.2 | Web framework |
+| pymongo | 4.8.0 | MongoDB driver |
+| mongomock | 4.1.2 | Test mock DB |
+| Docker | >= 24.0 | Containerization |

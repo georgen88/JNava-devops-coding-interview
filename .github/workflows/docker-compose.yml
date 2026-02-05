@@ -1,0 +1,37 @@
+# Local development docker-compose.
+# In production: ECS Fargate connects to DocumentDB via MONGO_URI
+# and Aurora RDS via DATABASE_URL — both injected by Terraform.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URI=mongodb://mongoadmin:localpass@mongo:27017/flights?authSource=admin
+      - MONGO_DB_NAME=flights
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongoadmin
+      MONGO_INITDB_ROOT_PASSWORD: localpass
+      MONGO_INITDB_DATABASE: flights
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:

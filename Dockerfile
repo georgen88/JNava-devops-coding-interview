@@ -1,29 +1,24 @@
-# Multi-stage build — adjust base image to match your app runtime
-# This example assumes a Node.js/Python FastAPI app; adapt as needed.
+FROM python:3.12-slim AS base
 
-# ── Stage 1: Build ───────────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY . .
-RUN npm run build 2>/dev/null || true
-
-# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
-FROM node:20-alpine AS runtime
 WORKDIR /app
 
-# Download AWS RDS CA bundle for DocumentDB TLS connections
-RUN apk add --no-cache wget && \
-    wget -q https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
-      -O /tmp/rds-combined-ca-bundle.pem && \
-    apk del wget
+# Install deps first for layer caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --from=builder /app .
+# Download AWS RDS/DocumentDB CA bundle for TLS connections
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates \
+    && wget -q https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+       -O /tmp/rds-combined-ca-bundle.pem \
+    && apt-get purge -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 3000
+# Copy application code — the app imports resolve relative to api/
+COPY api/ ./
+
+EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:3000/health || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/')" || exit 1
 
-CMD ["node", "dist/index.js"]
+# main.py does `from flights.router import ...` so WORKDIR must contain flights/
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
