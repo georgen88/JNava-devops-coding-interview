@@ -1,0 +1,50 @@
+# docker-compose.yml
+#
+# Local development compose file.
+# In production the app runs on ECS Fargate and connects to:
+#   - Aurora RDS Multi-AZ (PostgreSQL) via DATABASE_URL
+#   - DocumentDB (MongoDB-compatible) via MONGO_URI
+#
+# For local dev, a local MongoDB container is included as a stand-in for
+# DocumentDB. Replace the env vars below with your Aurora/DocumentDB
+# endpoints when testing against real AWS resources.
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=${NODE_ENV:-development}
+      # ── Database connections ──
+      # For local dev: uses local mongo container below
+      # For staging/prod: set these to Aurora RDS + DocumentDB endpoints
+      - DATABASE_URL=${DATABASE_URL:-postgresql://admin:localpass@localhost:5432/myapp}
+      - MONGO_URI=${MONGO_URI:-mongodb://mongoadmin:localpass@mongo:27017/myapp?authSource=admin}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Local MongoDB stand-in for DocumentDB (dev only)
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongoadmin
+      MONGO_INITDB_ROOT_PASSWORD: localpass
+      MONGO_INITDB_DATABASE: myapp
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:

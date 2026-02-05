@@ -1,0 +1,17 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to version control.
+
+aws_region    = "us-east-1"
+app_name      = "myapp"
+environment   = "prod"
+app_port      = 3000
+desired_count = 2
+
+# Sensitive — prefer passing via CLI or env vars in CI
+# db_username    = ""
+# db_password    = ""
+# docdb_username = ""
+# docdb_password = ""
+
+aurora_instance_class = "db.r6g.large"
+docdb_instance_class  = "db.r6g.large"
